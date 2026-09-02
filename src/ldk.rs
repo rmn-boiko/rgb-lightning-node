@@ -180,50 +180,27 @@ pub(crate) fn node_override_matches(
 
 // Test-only: the node with this pubkey puts an extra witness recipient of its own in front of the
 // channel output when it builds a colored funding transaction, so the channel output lands at vout
-// 2 instead of vout 1. Models a funding initiator that does not follow the one-recipient
-// convention: the funding transaction is built entirely by the initiator and LDK carries the
-// resulting index in `funding_created.funding_output_index`, so a peer is free to do this.
+// 2 instead of the vout 1 the acceptor assumes. A peer is free to do this: the funding transaction
+// is built entirely by the initiator and LDK carries the resulting index in
+// `funding_created.funding_output_index`.
 #[cfg(test)]
 pub(crate) static DECOY_FUNDING_OUTPUT_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
-
-// Test-only: the token RGB amount that goes to whichever of the two outputs is not meant to hold
-// the channel's assets when DECOY_FUNDING_OUTPUT_ON_NODE applies (rgb-lib rejects an assignment of
-// zero).
-#[cfg(test)]
-pub(crate) const DECOY_CHANNEL_ASSET_AMT: u64 = 1;
-
-// Test-only: which of the two outputs the channel's nominal RGB amount goes to when
-// DECOY_FUNDING_OUTPUT_ON_NODE applies. False (the default) leaves the assets on the channel
-// output and only moves its index; true keeps them on the initiator's own decoy output, so that
-// both peers agree on an RGB balance the funding output does not hold.
-#[cfg(test)]
-pub(crate) static DECOY_KEEPS_CHANNEL_ASSETS: AtomicBool = AtomicBool::new(false);
 
 // Test-only: satoshis paid to the decoy output built for DECOY_FUNDING_OUTPUT_ON_NODE
 #[cfg(test)]
 pub(crate) const DECOY_OUTPUT_SAT: u64 = 5_000;
 
-// Test-only: makes the decoy output built for DECOY_FUNDING_OUTPUT_ON_NODE pay the channel's own
-// script instead of a fresh wallet address, so the funding transaction would carry that script
-// twice — with a different value, which is the only shape in which the initiator's
-// `position(|o| o.script_pubkey == script_buf)` search and LDK's own script-and-value search can
-// disagree. Only has an effect together with DECOY_FUNDING_OUTPUT_ON_NODE.
-#[cfg(test)]
-pub(crate) static DECOY_REUSES_CHANNEL_SCRIPT: AtomicBool = AtomicBool::new(false);
-
 // Test-only: makes the decoy output built for DECOY_FUNDING_OUTPUT_ON_NODE receive an inflation
-// right instead of a fungible amount, so that the assignment the acceptor finds at its hard-coded
-// funding vout is one `handle_funding` has no arm for. Only meaningful for an IFA asset (rgb-lib
-// rejects an inflation-right recipient for any other schema) and only together with
-// DECOY_FUNDING_OUTPUT_ON_NODE.
+// right instead of a fungible amount, so the assignment the acceptor finds at its hard-coded
+// funding vout is one `handle_funding` has no arm for. Only meaningful for an IFA asset and only
+// together with DECOY_FUNDING_OUTPUT_ON_NODE.
 #[cfg(test)]
 pub(crate) static DECOY_INFLATION_ASSIGNMENT: AtomicBool = AtomicBool::new(false);
 
 // Test-only: the node with this pubkey sends the file named by SUBSTITUTE_CONSIGNMENT_PATH to its
 // counterparty in place of the consignment for the funding transaction it just built. Models a
-// peer that puts arbitrary bytes on the p2p link: the acceptor stores whatever arrives as
-// `consignment_{funding_txid}` and feeds it to `_accept_transfer` without ever having asked for
-// that particular consignment.
+// peer that puts arbitrary bytes on the p2p link: the acceptor stores whatever arrives and feeds
+// it to `_accept_transfer` without ever having asked for that particular consignment.
 #[cfg(test)]
 pub(crate) static SUBSTITUTE_CONSIGNMENT_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
 
@@ -864,53 +841,48 @@ async fn handle_ldk_events(
                 let recipient_id =
                     recipient_id_from_script_buf(script_buf.clone(), static_state.network);
 
+                let recipient_map = map! {
+                    asset_id.clone() => vec![Recipient {
+                        recipient_id: recipient_id.clone(),
+                        witness_data: Some(WitnessData {
+                            amount_sat: channel_value_satoshis,
+                            blinding: Some(STATIC_BLINDING),
+                        }),
+                        assignment,
+                        transport_endpoints: vec![]
+                }]};
+                // Test-only: prepend a decoy recipient of the initiator's own, so the channel
+                // output no longer lands at the vout the acceptor assumes
                 #[cfg(test)]
-                let decoy_funding_output = DECOY_FUNDING_OUTPUT_ON_NODE
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|id| *id == unlocked_state.channel_manager.get_our_node_id());
-                #[cfg(test)]
-                let (decoy_recipient, assignment) = if decoy_funding_output {
-                    let Assignment::Fungible(amount) = assignment else {
-                        panic!("TEST: the decoy funding output needs a fungible assignment")
-                    };
-                    let decoy_script = if DECOY_REUSES_CHANNEL_SCRIPT.load(Ordering::SeqCst) {
-                        script_buf.clone()
-                    } else {
-                        let unlocked_state_copy = unlocked_state.clone();
-                        let decoy_address = tokio::task::spawn_blocking(move || {
-                            unlocked_state_copy.rgb_get_address()
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap();
-                        rgb_lib::bitcoin::Address::from_str(&decoy_address)
+                let recipient_map = if node_override_matches(
+                    &DECOY_FUNDING_OUTPUT_ON_NODE,
+                    unlocked_state.channel_manager.get_our_node_id(),
+                ) {
+                    let unlocked_state_copy = unlocked_state.clone();
+                    let decoy_address =
+                        tokio::task::spawn_blocking(move || unlocked_state_copy.rgb_get_address())
+                            .await
                             .unwrap()
-                            .assume_checked()
-                            .script_pubkey()
-                    };
-                    let (decoy_amount, channel_amount) =
-                        if DECOY_KEEPS_CHANNEL_ASSETS.load(Ordering::SeqCst) {
-                            (amount, DECOY_CHANNEL_ASSET_AMT)
-                        } else {
-                            (DECOY_CHANNEL_ASSET_AMT, amount)
-                        };
+                            .unwrap();
+                    // rgb-lib rejects an assignment of zero, so the decoy carries a token 1
                     let decoy_assignment = if DECOY_INFLATION_ASSIGNMENT.load(Ordering::SeqCst) {
-                        Assignment::InflationRight(decoy_amount)
+                        Assignment::InflationRight(1)
                     } else {
-                        Assignment::Fungible(decoy_amount)
+                        Assignment::Fungible(1)
                     };
                     tracing::info!(
-                        "TEST: putting {decoy_assignment:?} of asset {asset_id} on a decoy output \
-                         to script {} ahead of the channel output, leaving {channel_amount} on \
-                         the channel output",
-                        decoy_script.to_hex_string()
+                        "TEST: putting {decoy_assignment:?} of asset {asset_id} on a decoy \
+                         output ahead of the channel output"
                     );
-                    (
-                        Some(Recipient {
+                    let mut recipient_map = recipient_map;
+                    recipient_map.get_mut(&asset_id).unwrap().insert(
+                        0,
+                        Recipient {
                             recipient_id: recipient_id_from_script_buf(
-                                decoy_script,
+                                rgb_lib::bitcoin::Address::from_str(&decoy_address)
+                                    .unwrap()
+                                    .assume_checked()
+                                    .script_pubkey(),
                                 static_state.network,
                             ),
                             witness_data: Some(WitnessData {
@@ -919,34 +891,12 @@ async fn handle_ldk_events(
                             }),
                             assignment: decoy_assignment,
                             transport_endpoints: vec![],
-                        }),
-                        Assignment::Fungible(channel_amount),
-                    )
+                        },
+                    );
+                    recipient_map
                 } else {
-                    (None, assignment)
+                    recipient_map
                 };
-
-                let recipients: Vec<Recipient> = vec![Recipient {
-                    recipient_id: recipient_id.clone(),
-                    witness_data: Some(WitnessData {
-                        amount_sat: channel_value_satoshis,
-                        blinding: Some(STATIC_BLINDING),
-                    }),
-                    assignment,
-                    transport_endpoints: vec![],
-                }];
-                // the decoy is prepended, so the channel output no longer lands where an
-                // unhooked node would put it
-                #[cfg(test)]
-                let recipients = match decoy_recipient {
-                    Some(decoy) => {
-                        let mut with_decoy = vec![decoy];
-                        with_decoy.extend(recipients);
-                        with_decoy
-                    }
-                    None => recipients,
-                };
-                let recipient_map = map! { asset_id.clone() => recipients };
 
                 let unlocked_state_copy = unlocked_state.clone();
                 let res = tokio::task::spawn_blocking(move || {
@@ -1061,28 +1011,23 @@ async fn handle_ldk_events(
                 let consignment_path =
                     unlocked_state.rgb_get_send_consignment_path(&asset_id, &funding_txid_str);
                 #[cfg(test)]
-                let consignment_path = {
-                    let substitute = SUBSTITUTE_CONSIGNMENT_ON_NODE
+                let consignment_path = if node_override_matches(
+                    &SUBSTITUTE_CONSIGNMENT_ON_NODE,
+                    unlocked_state.channel_manager.get_our_node_id(),
+                ) {
+                    let path = SUBSTITUTE_CONSIGNMENT_PATH
                         .lock()
                         .unwrap()
-                        .as_ref()
-                        .is_some_and(|id| *id == unlocked_state.channel_manager.get_our_node_id())
-                        .then(|| {
-                            SUBSTITUTE_CONSIGNMENT_PATH.lock().unwrap().clone().expect(
-                                "TEST: SUBSTITUTE_CONSIGNMENT_ON_NODE needs a substitute path",
-                            )
-                        });
-                    match substitute {
-                        Some(path) => {
-                            tracing::info!(
-                                "TEST: sending {} to the counterparty instead of the consignment \
-                                 for funding {funding_txid_str}",
-                                path.display()
-                            );
-                            path
-                        }
-                        None => consignment_path,
-                    }
+                        .clone()
+                        .expect("TEST: SUBSTITUTE_CONSIGNMENT_ON_NODE needs a substitute path");
+                    tracing::info!(
+                        "TEST: sending {} in place of the consignment for funding \
+                         {funding_txid_str}",
+                        path.display()
+                    );
+                    path
+                } else {
+                    consignment_path
                 };
                 let consignment_bytes = fs::read(&consignment_path)
                     .expect("consignment we just generated must be readable");

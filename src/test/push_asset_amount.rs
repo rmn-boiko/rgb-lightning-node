@@ -485,7 +485,7 @@ async fn acceptor_takes_an_inflated_push_asset_amount_from_a_hostile_peer() {
     // the funding transaction is never broadcast, so the reserved UTXO returns to the wallet
     let funding = funding_broadcast_state(node1_addr).await;
     assert!(
-        funding.as_ref().map_or(true, |(_, in_mempool)| !*in_mempool),
+        funding.as_ref().is_none_or(|(_, in_mempool)| !*in_mempool),
         "the funding transaction must not be broadcast for a rejected open: {funding:?}"
     );
 
