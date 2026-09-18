@@ -41,7 +41,7 @@ pub use derive::{
 pub use ffi::{derive_taproot_address, generate_keys, sdk_version};
 pub use gateway::{
     encode_uri_component, generate_idempotency_key, GatewayClient, HttpMethod, HttpRequest,
-    HttpResponse, HttpTransport, PreparedOp,
+    HttpResponse, HttpTransport, OperationState, OperationStatus, PreparedOp,
 };
 pub use invoice::{decode_bolt11, decode_rgb_invoice, BeneficiaryKind, Bolt11Invoice, RgbInvoice};
 pub use keys::{AccountXpubs, ClientKeys, GeneratedKeys};

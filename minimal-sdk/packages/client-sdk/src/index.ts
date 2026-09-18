@@ -68,6 +68,7 @@ export {
   type LnPayResult,
   type LnWithdrawParams,
   type LnWithdrawResult,
+  type OperationStatus,
   type PreparedOp,
   type PrepareCreateUtxosParams,
   type PrepareSendAssetParams,

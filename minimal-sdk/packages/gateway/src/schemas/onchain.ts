@@ -91,6 +91,48 @@ const completeErrorResponses = {
   410: errorBodySchema,
 } as const;
 
+/**
+ * Read-only operation status. Strict like every other response here: the PSBT
+ * is deliberately NOT echoed — the client already holds it from `prepare`, and
+ * a 64KB blob has no place in a recovery poll.
+ */
+export const operationGetRouteSchema = {
+  params: {
+    type: 'object',
+    properties: { opId: opIdSchema },
+    required: ['opId'],
+    additionalProperties: false,
+  },
+  response: {
+    200: {
+      type: 'object',
+      properties: {
+        opId: opIdSchema,
+        kind: { type: 'string', enum: ['send_btc', 'send_asset', 'create_utxos'] },
+        state: { type: 'string', enum: ['pending', 'completed', 'expired'] },
+        txid: { type: ['string', 'null'] },
+        mayHaveBroadcast: { type: 'boolean' },
+        intent: intentSchema,
+        createdAt: { type: 'integer' },
+        expiresAt: { type: 'integer' },
+      },
+      required: [
+        'opId',
+        'kind',
+        'state',
+        'txid',
+        'mayHaveBroadcast',
+        'intent',
+        'createdAt',
+        'expiresAt',
+      ],
+      additionalProperties: false,
+    },
+    401: errorBodySchema,
+    404: errorBodySchema,
+  },
+} as const;
+
 export const sendBtcPrepareRouteSchema = {
   body: {
     type: 'object',

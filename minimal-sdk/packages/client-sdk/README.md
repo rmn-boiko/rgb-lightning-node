@@ -65,6 +65,12 @@ const { txid } = await client.completeSendBtc({ opId: prepared.opId, signedPsbt 
 const paid = await client.payLnInvoice({ invoice: 'lnbc…' }, generateIdempotencyKey());
 ```
 
+If a `complete` call is lost — a timeout, a crash, or a 502 `COMPLETE_AMBIGUOUS` — do not
+prepare a replacement. Read the operation back instead: `getOnchainOperation(opId)` is an
+unqueued, key-free read, so it answers even while the completion is still running. A
+`mayHaveBroadcast: true` response means the transaction may already be on the network;
+retry `complete` to finish the bookkeeping rather than sending again.
+
 Asset sends (`prepareSendAsset`/`completeSendAsset`) and colorable-UTXO creation
 (`prepareCreateUtxos`/`completeCreateUtxos`) follow the same prepare → verify-and-sign →
 complete shape. LN float deposits (`prepareLnDeposit`), invoices (`createLnInvoice`,

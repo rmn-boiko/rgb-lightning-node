@@ -54,6 +54,16 @@ impl IntentKind {
             IntentKind::CreateUtxos => "create_utxos",
         }
     }
+
+    /// Inverse of [`IntentKind::name`], for decoding a gateway response.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "send_btc" => Some(IntentKind::SendBtc),
+            "send_asset" => Some(IntentKind::SendAsset),
+            "create_utxos" => Some(IntentKind::CreateUtxos),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for IntentKind {

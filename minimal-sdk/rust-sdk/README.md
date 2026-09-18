@@ -70,17 +70,27 @@ val registered = client.registerXpubs(
 //    broadcasts. prepareSendBtc binds the returned intent to the request you made
 //    (SdkException.IntentMismatch otherwise); verifyAndSignPsbt refuses to sign
 //    unless all five checks pass (SdkException.VerificationFailed names the check).
-val idem = generateIdempotencyKey()
+//    Each phase takes its OWN key: the gateway hashes method + path + body, so
+//    one key reused across prepare and complete is 409 IDEMPOTENCY_KEY_REUSED.
 val prepared = client.prepareSendBtc(
     PrepareSendBtcParams(address = "bc1p…", amountSat = 50_000UL, feeRateSatPerVb = 2UL),
-    idem,
+    generateIdempotencyKey(),
 )
 val signed = verifyAndSignPsbt(
     keys,
     prepared.psbt,
     VerifyParams(intent = prepared.intent, xpubs = xpubs, maxFeeSat = 1_000UL), // user-approved fee budget
 )
-val txid = client.completeSendBtc(CompleteParams(opId = prepared.opId, signedPsbt = signed.signedPsbt), idem).txid
+val txid = client.completeSendBtc(
+    CompleteParams(opId = prepared.opId, signedPsbt = signed.signedPsbt),
+    generateIdempotencyKey(),
+).txid
+
+// 5. If that complete is lost — timeout, crash, or 502 COMPLETE_AMBIGUOUS — do
+//    NOT prepare a replacement. Read the operation back; mayHaveBroadcast true
+//    means the transaction may already be on the network, so retry complete.
+val status = client.getOnchainOperation(prepared.opId)
+if (status.mayHaveBroadcast) { /* retry completeSendBtc with a fresh key */ }
 ```
 
 A transport over `HttpURLConnection` (OkHttp works the same way; only `send` exists):
@@ -132,16 +142,24 @@ let registered = try client.registerXpubs(
 // 4. Send BTC: prepare (intent bound to the request, SdkError.IntentMismatch
 //    otherwise) → verify and sign (SdkError.VerificationFailed names the failed
 //    check; nothing is signed) → complete.
-let idem = try generateIdempotencyKey()
+//    Each phase takes its OWN key: the gateway hashes method + path + body, so
+//    one key reused across prepare and complete is 409 IDEMPOTENCY_KEY_REUSED.
 let prepared = try client.prepareSendBtc(
     params: PrepareSendBtcParams(address: "bc1p…", amountSat: 50_000, feeRateSatPerVb: 2),
-    idempotencyKey: idem)
+    idempotencyKey: try generateIdempotencyKey())
 let signed = try verifyAndSignPsbt(
     keys: keys, psbt: prepared.psbt,
     params: VerifyParams(intent: prepared.intent, xpubs: xpubs, maxFeeSat: 1_000, // user-approved fee budget
                          changeScanWindow: nil, maxOwnOutputIndex: nil))
 let txid = try client.completeSendBtc(
-    params: CompleteParams(opId: prepared.opId, signedPsbt: signed.signedPsbt), idempotencyKey: idem).txid
+    params: CompleteParams(opId: prepared.opId, signedPsbt: signed.signedPsbt),
+    idempotencyKey: try generateIdempotencyKey()).txid
+
+// 5. If that complete is lost — timeout, crash, or 502 COMPLETE_AMBIGUOUS — do
+//    NOT prepare a replacement. Read the operation back; mayHaveBroadcast true
+//    means the transaction may already be on the network, so retry complete.
+let status = try client.getOnchainOperation(opId: prepared.opId)
+if status.mayHaveBroadcast { /* retry completeSendBtc with a fresh key */ }
 ```
 
 Asset sends (`prepareSendAsset` / `completeSendAsset`) and colorable-UTXO creation
@@ -149,8 +167,18 @@ Asset sends (`prepareSendAsset` / `completeSendAsset`) and colorable-UTXO creati
 → complete shape. Receiving (`receive`), balances, unspents, transfers, LN float
 deposits, invoices, payments and withdrawals round out `GatewayClient`;
 `decodeBolt11` / `decodeRgbInvoice` decode invoices locally for display before paying.
-Money-moving calls take an idempotency key: retry the **same** operation with the
-**same** key to get the cached response instead of a duplicate spend.
+Money-moving calls take an idempotency key: retry the **same** call with the **same**
+key to get the cached response instead of a duplicate spend. The key is scoped to one
+request — the gateway hashes method, path and body — so `prepare` and `complete` each
+need their own; reusing one across both is `409 IDEMPOTENCY_KEY_REUSED`.
+
+`getOnchainOperation(opId)` reads a prepared operation's durable state and is the
+recovery path when a `complete` result is lost. It is a read: no idempotency key, and the
+gateway does not queue it behind that user's wallet work, so it answers even while the
+completion it asks about is still running. `mayHaveBroadcast == true` means the wallet
+failed _after_ rgb-lib may already have broadcast — retry `complete` to finish the
+bookkeeping rather than sending again. It stays true on an expired operation, because
+expiry does not un-broadcast a transaction.
 
 ## The verify-before-sign contract
 
@@ -266,11 +294,11 @@ which apply here is what makes the minimal variant's case.
 ## Measured sizes
 
 Release profile `opt-level = "z"`, thin LTO, `codegen-units = 1`, `strip = "symbols"`,
-measured 2026-09-15.
+measured 2026-09-15; host cdylib re-measured 2026-09-18.
 
 | Artifact                                    |                       Raw |     gzip -9 | Note                                                                                    |
 | ------------------------------------------- | ------------------------: | ----------: | --------------------------------------------------------------------------------------- |
-| Host `x86_64-unknown-linux-gnu` cdylib      |               2 493 352 B | 1 682 403 B | size gate in `tests/parity.rs`: < 2 500 000 B                                           |
+| Host `x86_64-unknown-linux-gnu` cdylib      |               2 502 000 B | 1 685 630 B | size gate in `tests/parity.rs`: < 2 600 000 B                                           |
 | Android `arm64-v8a` `.so` (NDK r29)         |               2 366 720 B | 1 689 588 B | gate in `../scripts/build_android.sh`: < 3 000 000 B; `.text` 640 KB, `.rodata` 1.30 MB |
 | Android `armeabi-v7a` / `x86_64` `.so`      | 1 992 820 B / 2 508 984 B |           — |                                                                                         |
 | Android AAR (3 ABIs + 514 KB `classes.jar`) |               5 449 477 B |           — | a device installs one slice                                                             |

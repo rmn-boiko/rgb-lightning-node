@@ -207,6 +207,38 @@ describe('GatewayClient', () => {
     await expect(client.me()).rejects.toMatchObject({ code: 'NETWORK_ERROR' });
   });
 
+  it('getOnchainOperation reads the op route with no idempotency key', async () => {
+    const opId = '11111111-2222-4333-8444-555555555555';
+    const intent = {
+      kind: 'send_btc' as const,
+      feeRateSatPerVb: 2,
+      recipients: [],
+      asset: null,
+      utxos: null,
+    };
+    const { seen, fetchFn } = stubFetch([
+      jsonResponse(200, {
+        opId,
+        kind: 'send_btc',
+        state: 'pending',
+        txid: 'd'.repeat(64),
+        mayHaveBroadcast: true,
+        intent,
+        createdAt: 1,
+        expiresAt: 2,
+      }),
+    ]);
+    const client = new GatewayClient({ baseUrl: 'http://gw.local', token: 't', fetchFn });
+    const status = await client.getOnchainOperation(opId);
+    expect(seen[0]?.method).toBe('GET');
+    expect(seen[0]?.url).toBe(`http://gw.local/v1/onchain/operations/${opId}`);
+    // A read: polling it must never consume or require an idempotency key.
+    expect(seen[0]?.headers['idempotency-key']).toBeUndefined();
+    // The recovery signal after a lost complete.
+    expect(status.mayHaveBroadcast).toBe(true);
+    expect(status.txid).toBe('d'.repeat(64));
+  });
+
   it('LN money-moving calls (pay, withdraw) carry an idempotency key; reads do not', async () => {
     const { seen, fetchFn } = stubFetch([
       jsonResponse(200, { paymentHash: 'a'.repeat(64), status: 'pending' }),

@@ -70,6 +70,31 @@ export interface CompletedOp {
   utxosCreated: number | null;
 }
 
+/**
+ * Durable state of a prepared operation, readable after the client lost the
+ * outcome of `complete` (timeout, crash, 502 COMPLETE_AMBIGUOUS).
+ *
+ * `state` is the stored lifecycle state; `txid` is the transaction this op
+ * broadcast or may have broadcast. The combination that matters for recovery
+ * is `state: 'pending'` WITH a non-null `txid`: rgb-lib broadcasts before it
+ * finishes its bookkeeping, so that op's transaction may already be on the
+ * network even though the op never completed. `mayHaveBroadcast` surfaces
+ * exactly that case so a client does not have to re-derive it from the pair.
+ */
+export interface OperationStatus {
+  opId: string;
+  kind: OnchainOpKind;
+  state: 'pending' | 'completed' | 'expired';
+  /** Final txid once completed; the possibly-broadcast txid while ambiguous. */
+  txid: string | null;
+  /** True only while `state` is 'pending' and a txid is already recorded. */
+  mayHaveBroadcast: boolean;
+  /** The same intent summary `prepare` returned, for re-verification. */
+  intent: OnchainIntent;
+  createdAt: number;
+  expiresAt: number;
+}
+
 export interface PrepareSendBtcParams {
   address: string;
   amountSat: number;
@@ -174,6 +199,7 @@ interface PendingOpRow {
   intent: string;
   state: 'pending' | 'completed' | 'expired';
   txid: string | null;
+  created_at: number;
   expires_at: number;
 }
 
@@ -317,6 +343,41 @@ export class OnchainService {
       utxos,
     };
     return this.storePrepared(userId, 'create_utxos', psbt, intent, now);
+  }
+
+  /**
+   * Durable state of one prepared op, for a client that lost the outcome of
+   * `complete` — a timeout, a crash, or the 502 COMPLETE_AMBIGUOUS that rgb-lib's
+   * broadcast-before-bookkeeping ordering makes possible.
+   *
+   * A pure SQLite read: no wallet FFI and no RLN call, so it deliberately does
+   * NOT go through the per-user queue (see `routes/onchain.ts`).
+   *
+   * Expiry is derived, not written: a read must not mutate, and reporting the
+   * stored 'pending' for an op already past its TTL would contradict what a
+   * subsequent `complete` returns (410 OP_EXPIRED). `mayHaveBroadcast` survives
+   * that derivation on purpose — an expired op whose txid was recorded may still
+   * have its transaction on the network, and that is the fact worth reporting.
+   */
+  getOperation(userId: string, opId: string, now: number = Date.now()): OperationStatus {
+    const row = this.db.prepare('SELECT * FROM pending_ops WHERE id = ?').get(opId) as
+      PendingOpRow | undefined;
+    // A foreign user's op is indistinguishable from a missing one (I3) — same
+    // response as `complete`, so this route leaks no existence information.
+    if (row === undefined || row.user_id !== userId) {
+      throw new HttpError(404, 'OP_NOT_FOUND', 'no such prepared operation');
+    }
+    const state = row.state === 'pending' && row.expires_at <= now ? 'expired' : row.state;
+    return {
+      opId: row.id,
+      kind: row.kind,
+      state,
+      txid: row.txid,
+      mayHaveBroadcast: row.txid !== null && state !== 'completed',
+      intent: JSON.parse(row.intent) as OnchainIntent,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+    };
   }
 
   /**

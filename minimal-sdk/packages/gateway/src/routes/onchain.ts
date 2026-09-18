@@ -8,6 +8,7 @@ import type { FastifyInstance, FastifySchema } from 'fastify';
 import {
   createUtxosCompleteRouteSchema,
   createUtxosPrepareRouteSchema,
+  operationGetRouteSchema,
   sendAssetCompleteRouteSchema,
   sendAssetPrepareRouteSchema,
   sendBtcCompleteRouteSchema,
@@ -43,6 +44,23 @@ export function registerOnchainRoutes(app: FastifyInstance): void {
       });
     });
   };
+
+  // Read-only recovery route: the outcome of `complete` can be lost to a
+  // timeout, a crash, or the 502 COMPLETE_AMBIGUOUS that rgb-lib's
+  // broadcast-before-bookkeeping ordering makes possible, and the txid is
+  // recorded on the op in exactly that case. Deliberately NOT on the per-user
+  // queue and with no Idempotency-Key: it is a single SQLite read, and queueing
+  // it behind the very wallet call that is stuck would make it unavailable
+  // precisely when a client needs it.
+  app.get(
+    '/v1/onchain/operations/:opId',
+    { schema: operationGetRouteSchema, onRequest: [app.authenticate] },
+    (request) => {
+      const userId = request.userId as string;
+      const { opId } = request.params as { opId: string };
+      return app.onchain.getOperation(userId, opId);
+    },
+  );
 
   app.post(
     '/v1/onchain/send-btc/prepare',

@@ -346,6 +346,49 @@ pub struct CreateUtxosCompleteResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OperationState {
+    Pending,
+    Completed,
+    Expired,
+}
+
+impl OperationState {
+    fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(OperationState::Pending),
+            "completed" => Some(OperationState::Completed),
+            "expired" => Some(OperationState::Expired),
+            _ => None,
+        }
+    }
+}
+
+/// Durable state of a prepared on-chain operation, for recovery after the
+/// outcome of a `complete` call was lost — a timeout, a crash, or the 502
+/// `COMPLETE_AMBIGUOUS` the gateway returns when its wallet failed *after*
+/// rgb-lib may already have broadcast.
+///
+/// `may_have_broadcast` is the field that matters in that case: rgb-lib
+/// broadcasts before it writes its bookkeeping, so a txid can be recorded on an
+/// operation that never completed. When it is true the transaction may already
+/// be on the network — retry `complete` (safe, and it finishes the bookkeeping)
+/// rather than preparing a second operation. It stays true on an `Expired`
+/// operation, because expiry does not un-broadcast a transaction.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct OperationStatus {
+    pub op_id: String,
+    pub kind: IntentKind,
+    pub state: OperationState,
+    /// Final txid once completed; the possibly-broadcast txid while ambiguous.
+    pub txid: Option<String>,
+    pub may_have_broadcast: bool,
+    /// The same intent summary `prepare` returned.
+    pub intent: OnchainIntent,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum LnAssetKind {
     Btc,
     Rgb,
@@ -1117,6 +1160,44 @@ impl GatewayClient {
         })
     }
 
+    /// Read back a prepared operation's durable state.
+    ///
+    /// Safe to poll: a read, no idempotency key, and the gateway does not queue
+    /// it behind that user's wallet work — so it answers even while the
+    /// `complete` being asked about is still running. It never returns the
+    /// PSBT; the caller already holds it from `prepare`.
+    pub fn get_onchain_operation(&self, op_id: &str) -> SdkResult<OperationStatus> {
+        let v = self.request(RequestSpec::get(format!(
+            "/v1/onchain/operations/{}",
+            encode_uri_component(op_id)
+        )))?;
+        let state_wire = field_str(&v, "state")?;
+        let state = OperationState::from_wire(&state_wire)
+            .ok_or_else(|| malformed(&format!("unknown operation state {state_wire:?}")))?;
+        let kind_wire = field_str(&v, "kind")?;
+        let kind = IntentKind::from_wire(&kind_wire)
+            .ok_or_else(|| malformed(&format!("unknown operation kind {kind_wire:?}")))?;
+        let intent = v
+            .get("intent")
+            .ok_or_else(|| malformed("operation carries no intent summary"))?;
+        // Reuse the same typed decoder `prepare` uses, so a field this SDK
+        // cannot represent fails here rather than surfacing as a silent default.
+        let intent = typed_intent(intent, kind).map_err(|e| malformed(&e))?;
+        Ok(OperationStatus {
+            op_id: field_str(&v, "opId")?,
+            kind,
+            state,
+            txid: field_opt_str(&v, "txid")?,
+            may_have_broadcast: v
+                .get("mayHaveBroadcast")
+                .and_then(Json::as_bool)
+                .ok_or_else(|| malformed("mayHaveBroadcast is not a boolean"))?,
+            intent,
+            created_at: field_u64(&v, "createdAt")?,
+            expires_at: field_u64(&v, "expiresAt")?,
+        })
+    }
+
     /// Pin the idempotency key to retry a prepare without minting a second
     /// deposit target.
     pub fn prepare_ln_deposit(
@@ -1673,6 +1754,11 @@ impl GatewayClient {
         idempotency_key: Option<String>,
     ) -> SdkResult<CreateUtxosCompleteResult> {
         self.complete_create_utxos(&params, idempotency_key)
+    }
+
+    #[uniffi::method(name = "get_onchain_operation")]
+    pub fn ffi_get_onchain_operation(&self, op_id: String) -> SdkResult<OperationStatus> {
+        self.get_onchain_operation(&op_id)
     }
 
     #[uniffi::method(name = "prepare_ln_deposit")]

@@ -130,6 +130,27 @@ export interface CompleteParams {
   signedPsbt: string;
 }
 
+/**
+ * Durable state of a prepared on-chain operation, for recovery after the
+ * outcome of `complete` was lost (timeout, crash, 502 COMPLETE_AMBIGUOUS).
+ *
+ * `mayHaveBroadcast` is the field that matters after a failed complete: the
+ * gateway's wallet broadcasts before it finishes its bookkeeping, so a txid can
+ * be recorded on an operation that never completed. When it is true the
+ * transaction may already be on the network — retry `complete` (which is safe
+ * and finishes the bookkeeping) rather than preparing a second operation.
+ */
+export interface OperationStatus {
+  opId: string;
+  kind: OnchainIntent['kind'];
+  state: 'pending' | 'completed' | 'expired';
+  txid: string | null;
+  mayHaveBroadcast: boolean;
+  intent: OnchainIntent;
+  createdAt: number;
+  expiresAt: number;
+}
+
 /** A prepare response whose intent summary contradicts the request that produced it. */
 export class IntentMismatchError extends Error {
   constructor(readonly mismatches: string[]) {
@@ -524,6 +545,18 @@ export class GatewayClient {
     idempotencyKey?: string,
   ): Promise<{ txid: string | null; utxosCreated: number }> {
     return this.post('/v1/onchain/create-utxos/complete', params, idempotencyKey);
+  }
+
+  /**
+   * Read back a prepared operation. Safe to poll: it is a read, takes no
+   * idempotency key, and is not queued behind the gateway's wallet work, so it
+   * answers even while a `complete` for the same user is still running.
+   */
+  getOnchainOperation(opId: string): Promise<OperationStatus> {
+    return this.request({
+      method: 'GET',
+      path: `/v1/onchain/operations/${encodeURIComponent(opId)}`,
+    });
   }
 
   /** Pin the idempotency key to retry a prepare without minting a second intent. */

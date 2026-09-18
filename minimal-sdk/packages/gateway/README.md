@@ -73,6 +73,7 @@ auto-retries a send.
 | POST   | `/v1/onchain/send-asset/complete`   | bearer   | required        |
 | POST   | `/v1/onchain/create-utxos/prepare`  | bearer   | required        |
 | POST   | `/v1/onchain/create-utxos/complete` | bearer   | required        |
+| GET    | `/v1/onchain/operations/:opId`      | bearer   | —               |
 | POST   | `/v1/ln/deposit/prepare`            | bearer   | required        |
 | POST   | `/v1/ln/pay`                        | bearer   | required        |
 | POST   | `/v1/ln/invoice`                    | bearer   | —               |
@@ -85,32 +86,73 @@ auto-retries a send.
 
 Every error response is `{"error": {"code", "message"}}`. Notable codes:
 
-| Code                                     | Status    | Meaning                                                                                                                                                                                                                   |
-| ---------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `QUEUE_FULL`                             | 429       | Per-user queue depth exceeded; a `retry-after` header accompanies it.                                                                                                                                                     |
-| `AMOUNT_REQUIRED`                        | 400       | BTC invoices must declare `amtMsat`, asset invoices `assetAmount` (their `amtMsat` HTLC carrier defaults to `GATEWAY_ASSET_INVOICE_MIN_MSAT`), and paying an amount-less invoice requires `amtMsat` (a float-cap bypass). |
-| `AMOUNT_MISMATCH`                        | 400       | `amtMsat` or `assetAmount` conflicts with the amount encoded in the invoice.                                                                                                                                              |
-| `AMOUNT_BELOW_MINIMUM`                   | 400       | An asset invoice's `amtMsat` HTLC carrier value is under `GATEWAY_ASSET_INVOICE_MIN_MSAT`; the node would refuse it.                                                                                                      |
-| `INVOICE_REJECTED`                       | 400       | The node rejected these invoice parameters. Detail stays server-side.                                                                                                                                                     |
-| `INVALID_INVOICE`                        | 400       | The BOLT11 could not be decoded, or its amount is zero / outside the safe-integer range.                                                                                                                                  |
-| `PAYMENT_REJECTED` / `WITHDRAW_REJECTED` | 400       | The node rejected this payment or withdrawal (an RLN 4xx). The debit is refunded. Detail stays server-side.                                                                                                               |
-| `WITNESS_AMOUNT_REQUIRED`                | 400       | An RGB withdraw to a `wvout:` recipient needs `witnessAmountSat` (rgb-lib rejects a witness beneficiary without it). The node funds that output, so its sats are debited from the caller's msat float.                    |
-| `TRANSPORT_ENDPOINT_NOT_ALLOWED`         | 400       | Consignment endpoint outside `GATEWAY_RGB_TRANSPORT_ALLOWLIST` (SSRF guard).                                                                                                                                              |
-| `WALLET_REQUEST_REJECTED`                | 400       | rgb-lib rejected the request itself — bad recipient id, asset id, address, fee rate or transport endpoint. Detail stays server-side.                                                                                      |
-| `INSUFFICIENT_FUNDS`                     | 400       | Not enough confirmed bitcoins, assets or allocation slots for an on-chain operation.                                                                                                                                      |
-| `PSBT_REJECTED` / `PSBT_MISMATCH`        | 400       | The signed PSBT was rejected, or does not correspond to the prepared operation.                                                                                                                                           |
-| `FLOAT_CAP_EXCEEDED`                     | 409       | Per-user or global float cap would be exceeded by this new exposure.                                                                                                                                                      |
-| `INSUFFICIENT_BALANCE`                   | 409       | The user's ledger balance is short.                                                                                                                                                                                       |
-| `IDEMPOTENCY_KEY_REUSED`                 | 409       | Same key, different request body.                                                                                                                                                                                         |
-| `IDEMPOTENCY_IN_FLIGHT`                  | 409       | A request with this key is still running.                                                                                                                                                                                 |
-| `PAYMENT_CONFLICT`                       | 409       | Another user is already paying this invoice.                                                                                                                                                                              |
-| `PAYMENT_ALREADY_ATTEMPTED`              | 409       | This invoice already failed and was refunded — request a fresh invoice rather than re-paying an old one.                                                                                                                  |
-| `WITHDRAWAL_ALREADY_ATTEMPTED`           | 409       | A withdrawal under this key failed and was refunded — use a fresh key. (A rejection answered 4xx is instead replayed from the idempotency cache.)                                                                         |
-| `WITHDRAWAL_UNRESOLVED`                  | 409       | A withdrawal under this key is unresolved and may have broadcast; operator resolution required (see Known limitations).                                                                                                   |
-| `DEPOSIT_ADDRESS_CONFLICT`               | 502       | RLN returned a deposit address (or RGB `recipient_id`) already assigned to another intent — it is misconfigured (see the deployment note).                                                                                |
-| `OP_EXPIRED`                             | 410       | The prepared on-chain operation passed `GATEWAY_ONCHAIN_OP_TTL_SECONDS`; prepare again.                                                                                                                                   |
-| `UPSTREAM_ERROR` / `UPSTREAM_TIMEOUT`    | 502 / 504 | Sanitized RLN failures.                                                                                                                                                                                                   |
-| `COMPLETE_AMBIGUOUS`                     | 502       | The wallet failed while completing an on-chain op, after rgb-lib may already have broadcast. The op stays pending with its txid recorded; retrying `complete` finishes the bookkeeping.                                   |
+| Code                                     | Status    | Meaning                                                                                                                                                                                                                                        |
+| ---------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `QUEUE_FULL`                             | 429       | Per-user queue depth exceeded; a `retry-after` header accompanies it.                                                                                                                                                                          |
+| `AMOUNT_REQUIRED`                        | 400       | BTC invoices must declare `amtMsat`, asset invoices `assetAmount` (their `amtMsat` HTLC carrier defaults to `GATEWAY_ASSET_INVOICE_MIN_MSAT`), and paying an amount-less invoice requires `amtMsat` (a float-cap bypass).                      |
+| `AMOUNT_MISMATCH`                        | 400       | `amtMsat` or `assetAmount` conflicts with the amount encoded in the invoice.                                                                                                                                                                   |
+| `AMOUNT_BELOW_MINIMUM`                   | 400       | An asset invoice's `amtMsat` HTLC carrier value is under `GATEWAY_ASSET_INVOICE_MIN_MSAT`; the node would refuse it.                                                                                                                           |
+| `INVOICE_REJECTED`                       | 400       | The node rejected these invoice parameters. Detail stays server-side.                                                                                                                                                                          |
+| `INVALID_INVOICE`                        | 400       | The BOLT11 could not be decoded, or its amount is zero / outside the safe-integer range.                                                                                                                                                       |
+| `PAYMENT_REJECTED` / `WITHDRAW_REJECTED` | 400       | The node rejected this payment or withdrawal (an RLN 4xx). The debit is refunded. Detail stays server-side.                                                                                                                                    |
+| `WITNESS_AMOUNT_REQUIRED`                | 400       | An RGB withdraw to a `wvout:` recipient needs `witnessAmountSat` (rgb-lib rejects a witness beneficiary without it). The node funds that output, so its sats are debited from the caller's msat float.                                         |
+| `TRANSPORT_ENDPOINT_NOT_ALLOWED`         | 400       | Consignment endpoint outside `GATEWAY_RGB_TRANSPORT_ALLOWLIST` (SSRF guard).                                                                                                                                                                   |
+| `WALLET_REQUEST_REJECTED`                | 400       | rgb-lib rejected the request itself — bad recipient id, asset id, address, fee rate or transport endpoint. Detail stays server-side.                                                                                                           |
+| `INSUFFICIENT_FUNDS`                     | 400       | Not enough confirmed bitcoins, assets or allocation slots for an on-chain operation.                                                                                                                                                           |
+| `PSBT_REJECTED` / `PSBT_MISMATCH`        | 400       | The signed PSBT was rejected, or does not correspond to the prepared operation.                                                                                                                                                                |
+| `FLOAT_CAP_EXCEEDED`                     | 409       | Per-user or global float cap would be exceeded by this new exposure.                                                                                                                                                                           |
+| `INSUFFICIENT_BALANCE`                   | 409       | The user's ledger balance is short.                                                                                                                                                                                                            |
+| `IDEMPOTENCY_KEY_REUSED`                 | 409       | Same key, different request body.                                                                                                                                                                                                              |
+| `IDEMPOTENCY_IN_FLIGHT`                  | 409       | A request with this key is still running.                                                                                                                                                                                                      |
+| `PAYMENT_CONFLICT`                       | 409       | Another user is already paying this invoice.                                                                                                                                                                                                   |
+| `PAYMENT_ALREADY_ATTEMPTED`              | 409       | This invoice already failed and was refunded — request a fresh invoice rather than re-paying an old one.                                                                                                                                       |
+| `WITHDRAWAL_ALREADY_ATTEMPTED`           | 409       | A withdrawal under this key failed and was refunded — use a fresh key. (A rejection answered 4xx is instead replayed from the idempotency cache.)                                                                                              |
+| `WITHDRAWAL_UNRESOLVED`                  | 409       | A withdrawal under this key is unresolved and may have broadcast; operator resolution required (see Known limitations).                                                                                                                        |
+| `DEPOSIT_ADDRESS_CONFLICT`               | 502       | RLN returned a deposit address (or RGB `recipient_id`) already assigned to another intent — it is misconfigured (see the deployment note).                                                                                                     |
+| `OP_EXPIRED`                             | 410       | The prepared on-chain operation passed `GATEWAY_ONCHAIN_OP_TTL_SECONDS`; prepare again.                                                                                                                                                        |
+| `UPSTREAM_ERROR` / `UPSTREAM_TIMEOUT`    | 502 / 504 | Sanitized RLN failures.                                                                                                                                                                                                                        |
+| `COMPLETE_AMBIGUOUS`                     | 502       | The wallet failed while completing an on-chain op, after rgb-lib may already have broadcast. The op stays pending with its txid recorded; read it back with `GET /v1/onchain/operations/:opId` and retry `complete` to finish the bookkeeping. |
+
+## Recovering a lost on-chain completion
+
+`complete` can leave a client without an answer: a client-side timeout, a crash, or the
+502 `COMPLETE_AMBIGUOUS` the gateway returns when the wallet fails _after_ rgb-lib may
+already have broadcast (rgb-lib broadcasts before it writes its bookkeeping). The
+operation row is the durable record of what happened, and
+`GET /v1/onchain/operations/:opId` reads it back.
+
+```jsonc
+{
+  "opId": "…", "kind": "send_btc",
+  "state": "pending",              // pending | completed | expired
+  "txid": "…",                     // final when completed; possibly-broadcast otherwise
+  "mayHaveBroadcast": true,        // state != completed AND a txid is recorded
+  "intent": { … },                 // the same summary prepare returned
+  "createdAt": 1700000000000, "expiresAt": 1700000900000
+}
+```
+
+How to read it:
+
+| `state`     | `mayHaveBroadcast` | Meaning                                           | Do                                                                                                                   |
+| ----------- | ------------------ | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `completed` | `false`            | Done; `txid` is final                             | nothing                                                                                                              |
+| `pending`   | `false`            | Prepared, never broadcast                         | sign and `complete`, or let it expire                                                                                |
+| `pending`   | `true`             | **The transaction may already be on the network** | retry `complete` — it is safe (rebroadcasting a transaction the indexer knows succeeds) and finishes the bookkeeping |
+| `expired`   | `true`             | Past TTL, but a txid was recorded                 | do **not** prepare a replacement before checking `txid` on-chain; needs operator resolution                          |
+
+Three properties worth relying on. It takes **no** `Idempotency-Key` and is not queued
+behind the per-user wallet work, so it answers even while the `complete` you are asking
+about is still running — safe to poll. It never echoes the PSBT; the client already holds
+it from `prepare`. And an operation belonging to another user is reported as `404
+OP_NOT_FOUND`, identical to one that does not exist (I3).
+
+Expiry is **derived** on read, never written: an op past `expiresAt` reports `expired`
+here while the stored row stays `pending` until `complete` flips it. Note the last row of
+the table — an op that expires while ambiguous can no longer be completed (`complete`
+answers 410), so its bookkeeping stays unfinished even though the transaction may be
+confirmed. Raising `GATEWAY_ONCHAIN_OP_TTL_SECONDS` above the worst-case wallet stall is
+the mitigation today.
 
 ## Configuration reference
 

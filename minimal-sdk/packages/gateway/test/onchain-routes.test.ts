@@ -529,6 +529,120 @@ describe('on-chain prepare/complete routes', () => {
     });
   });
 
+  describe('GET /v1/onchain/operations/:opId', () => {
+    async function getOp(opId: string, token?: string) {
+      return app.inject({
+        method: 'GET',
+        url: `/v1/onchain/operations/${opId}`,
+        headers: { authorization: `Bearer ${token ?? user.token}` },
+      });
+    }
+
+    it('reports a freshly prepared op as pending with no txid', async () => {
+      const prepared = (await prepareSendBtc()).json();
+      const response = await getOp(prepared.opId);
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        opId: prepared.opId,
+        kind: 'send_btc',
+        state: 'pending',
+        txid: null,
+        mayHaveBroadcast: false,
+        intent: prepared.intent,
+        createdAt: expect.any(Number),
+        expiresAt: prepared.expiresAt,
+      });
+    });
+
+    it('reports the final txid once the op completed', async () => {
+      const { opId } = (await prepareSendBtc()).json();
+      const completed = await complete('send-btc', opId);
+      expect(completed.statusCode).toBe(200);
+      const body = (await getOp(opId)).json();
+      expect(body.state).toBe('completed');
+      expect(body.txid).toBe(completed.json().txid);
+      expect(body.mayHaveBroadcast).toBe(false);
+    });
+
+    // The reason this route exists: after a 502 the client does not know whether
+    // its money moved, and the op carries the answer.
+    it('surfaces mayHaveBroadcast with the txid after COMPLETE_AMBIGUOUS', async () => {
+      backend.dataFor = () => ({ preparedPsbt: PARSABLE_PSBT_A });
+      app.walletPool.evict(user.userId);
+      const { opId } = (await prepareSendBtc()).json();
+      backend.handleFor(user.userId)!.failWith = new WalletBackendError(
+        'wallet sendBtcEnd failed',
+        'RgbLib(Database { details: "error returned from database: disk I/O error" })',
+      );
+      const ambiguous = await complete('send-btc', opId, { signedPsbt: PARSABLE_PSBT_A });
+      expect(ambiguous.statusCode).toBe(502);
+
+      const body = (await getOp(opId)).json();
+      expect(body.state).toBe('pending');
+      expect(body.txid).toBe(txidFromPsbt(PARSABLE_PSBT_A));
+      expect(body.mayHaveBroadcast).toBe(true);
+
+      // And it follows the op through the documented recovery: retry completes.
+      backend.handleFor(user.userId)!.failWith = undefined;
+      expect((await complete('send-btc', opId, { signedPsbt: PARSABLE_PSBT_A })).statusCode).toBe(
+        200,
+      );
+      const after = (await getOp(opId)).json();
+      expect(after.state).toBe('completed');
+      expect(after.mayHaveBroadcast).toBe(false);
+    });
+
+    it('derives expiry past the TTL without writing to the row', async () => {
+      const { opId } = (await prepareSendBtc()).json();
+      app.db
+        .prepare('UPDATE pending_ops SET expires_at = ? WHERE id = ?')
+        .run(Date.now() - 1, opId);
+      expect((await getOp(opId)).json().state).toBe('expired');
+      // A read must not mutate: the stored state is still what complete() will
+      // find and flip itself.
+      expect(opRow(opId)?.state).toBe('pending');
+    });
+
+    // An expired op whose txid was recorded may still have its transaction on
+    // the network, so the signal must survive the derived expiry.
+    it('keeps mayHaveBroadcast on an expired op that recorded a txid', async () => {
+      const { opId } = (await prepareSendBtc()).json();
+      app.db
+        .prepare('UPDATE pending_ops SET expires_at = ?, txid = ? WHERE id = ?')
+        .run(Date.now() - 1, 'f'.repeat(64), opId);
+      const body = (await getOp(opId)).json();
+      expect(body.state).toBe('expired');
+      expect(body.mayHaveBroadcast).toBe(true);
+    });
+
+    it("hides another user's op behind the same 404 as a missing one (I3)", async () => {
+      const { opId } = (await prepareSendBtc()).json();
+      const stranger = await createTestUser(app);
+      const foreign = await getOp(opId, stranger.token);
+      const missing = await getOp(randomUUID(), stranger.token);
+      expect(foreign.statusCode).toBe(404);
+      expect(missing.statusCode).toBe(404);
+      expect(foreign.json()).toEqual(missing.json());
+      expect(foreign.json().error.code).toBe('OP_NOT_FOUND');
+    });
+
+    it('requires auth and never echoes the PSBT', async () => {
+      const prepared = (await prepareSendBtc()).json();
+      const unauthenticated = await app.inject({
+        method: 'GET',
+        url: `/v1/onchain/operations/${prepared.opId}`,
+      });
+      expect(unauthenticated.statusCode).toBe(401);
+      const body = (await getOp(prepared.opId)).body;
+      expect(body).not.toContain(prepared.psbt);
+      expect(JSON.parse(body)).not.toHaveProperty('psbt');
+    });
+
+    it('rejects a malformed opId at the schema layer', async () => {
+      expect((await getOp('not-a-uuid')).statusCode).toBe(400);
+    });
+  });
+
   describe('input validation', () => {
     it('rejects a non-base64 signed PSBT at the schema layer', async () => {
       const response = await app.inject({
